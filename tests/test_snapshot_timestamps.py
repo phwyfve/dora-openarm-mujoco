@@ -18,12 +18,83 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import mujoco
+import numpy as np
 import pyarrow as pa
 
 main = importlib.import_module("dora_openarm_mujoco.main")
 
 
 class SnapshotTimestampTests(unittest.TestCase):
+    def test_synchronous_actions_advance_only_after_both_arms(self):
+        model = mujoco.MjModel.from_xml_string(
+            '<mujoco><option timestep="0.001"/><worldbody>'
+            '<body><joint name="openarm_right_joint1"/><geom size="0.1" mass="1"/>'
+            '</body></worldbody></mujoco>'
+        )
+        data = mujoco.MjData(model)
+        node = MagicMock()
+        mapper = MagicMock()
+        target = pa.array(
+            [{"qpos": np.zeros(8, dtype=np.float32)}], type=main._QPOS_TYPE
+        )
+
+        def events():
+            for step in range(30):
+                previous_time = data.time
+                yield {
+                    "type": "INPUT", "id": "move_position_right",
+                    "value": target, "metadata": {"control_step": step},
+                }
+                self.assertEqual(data.time, previous_time)
+                self.assertEqual(mapper.set_ctrl.call_count, step * 2)
+                yield {"type": "INPUT", "id": "ui_tick"}
+                self.assertEqual(data.time, previous_time)
+                yield {
+                    "type": "INPUT", "id": "move_position_left",
+                    "value": target, "metadata": {"control_step": step},
+                }
+                self.assertLessEqual(abs(data.time - (step + 1) / 30), 0.0005 + 1e-12)
+
+        node.__iter__.return_value = events()
+        scheduler = MagicMock()
+        main._run_synchronous(
+            node, model, data, mapper, threading.Event(), 30,
+            threading.Lock, cam_scheduler=scheduler,
+        )
+        self.assertAlmostEqual(data.time, 1.0, places=10)
+        self.assertEqual(mapper.set_ctrl.call_count, 60)
+        calls = node.send_output.call_args_list
+        self.assertEqual(len(calls), 31 * 3)
+        for step in range(31):
+            snapshot = calls[step * 3:step * 3 + 3]
+            self.assertEqual([call.args[0] for call in snapshot],
+                             ["state_right", "state_left", "control_tick"])
+            metadata = snapshot[0].kwargs["metadata"]
+            self.assertEqual(metadata["control_step"], step)
+            self.assertTrue(all(call.kwargs["metadata"] == metadata for call in snapshot))
+            self.assertEqual(scheduler.publish.call_args_list[step].args[1], metadata)
+
+    def test_synchronous_mismatched_action_never_advances_physics(self):
+        model = mujoco.MjModel.from_xml_string(
+            '<mujoco><worldbody><body><joint/><geom size="0.1" mass="1"/>'
+            '</body></worldbody></mujoco>'
+        )
+        data = mujoco.MjData(model)
+        node = MagicMock()
+        mapper = MagicMock()
+        target = pa.array([{"qpos": [0.0] * 8}], type=main._QPOS_TYPE)
+        node.__iter__.return_value = [
+            {"type": "INPUT", "id": f"move_position_{side}",
+             "value": target, "metadata": {"control_step": step}}
+            for side, step in (("right", 0), ("left", 1))
+        ]
+        with self.assertRaisesRegex(ValueError, "Expected control_step=0"):
+            main._run_synchronous(
+                node, model, data, mapper, threading.Event(), 30, threading.Lock,
+            )
+        self.assertEqual(data.time, 0)
+        mapper.set_ctrl.assert_not_called()
+
     def test_request_outputs_and_snapshot_timestamps(self):
         model = mujoco.MjModel.from_xml_string(
             '<mujoco><worldbody><body><joint name="openarm_right_joint1"/>'

@@ -62,7 +62,43 @@ uv run dora run dataflow-dummy.yaml
     - camera_ceiling
 ```
 
+## Synchronous policy control (opt-in)
+
+`--ctrl --sync-control 30` uses 30 actions per **simulated** second. Default
+teleoperation and recording behavior is unchanged.
+
+```text
+states + cameras + control_tick -> policy -> both arm targets -> physics -> repeat
+```
+
+An initial snapshot at step zero bootstraps inference. Every `control_tick`,
+`state_*`, and camera output carries the same `control_step`,
+`observation_timestamp`, and `simulation_time`. Reply on both existing
+`move_position_*` ports with `control_step` metadata matching that snapshot.
+Both targets are applied together before advancing physics; no next step runs
+until both arrive. Integer physics steps alternate to approximate 1/30 s without
+accumulating rounding drift. Rendering and inference never advance physics.
+
+Connect `ui_tick` to a 50 ms Dora timer solely for viewer responsiveness and a
+60 s missing-action watchdog. Do not connect request/reset/pose inputs in this
+mode. Close the viewer or stop the dataflow; restart it for a fresh episode
+instead of using native Reset. Camera outputs remain optional without `--render`.
+
 ## Inputs
+
+### Coordinated reset
+
+The recording flow's **Reset scene** button sends `"reset"` on the `reset`
+input with positive integer `reset_id` metadata. It restores the entire
+`--keyframe`: all objects/fixtures, arms, velocities, simulation time and control
+targets. With `--randomize-objects`, freejoint objects are randomized afterwards.
+A valid keyframe is required. `reset_ready` returns the completed reset ID.
+Arm and debug-pose messages must carry the matching `reset_id`; older commands
+are discarded. Flows without resets retain the default ID zero.
+
+MuJoCo's built-in **Reset** instead uses `qpos0` (zero elbow angles in this
+model), not the startup `home` keyframe. It also does not reset the external
+keyboard or IK. Use the coordinated button between recorded episodes instead.
 
 | ID | Type | Description |
 |----|------|-------------|

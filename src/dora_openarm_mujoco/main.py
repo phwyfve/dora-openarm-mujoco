@@ -481,15 +481,20 @@ class CameraScheduler:
     def tick(self, lock_fn) -> None:
         if time.perf_counter() < self._next:
             return
+        self.publish(lock_fn)
+        self._next += _CAM_DT
+
+    def publish(self, lock_fn, metadata: dict | None = None) -> None:
         with lock_fn():
             images = self._renderer.render_all(self._data)
+        if metadata is not None and set(images) != set(_CAMERAS):
+            raise RuntimeError("Synchronous control requires all five camera images")
         for cam_name, jpeg_bytes in images.items():
             self._node.send_output(
                 cam_name,
                 pa.array(np.frombuffer(jpeg_bytes, dtype=np.uint8), type=pa.uint8()),
-                metadata={"encoding": "jpeg"},
+                metadata={**(metadata or {}), "encoding": "jpeg"},
             )
-        self._next += _CAM_DT
 
     def close(self) -> None:
         self._renderer.close()
@@ -516,6 +521,22 @@ def _handle_arm(
             mujoco.mj_forward(model, data)
 
 
+def _reset_simulation(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    mapper: JointResolver,
+    key_id: int,
+    use_ctrl: bool,
+) -> None:
+    if key_id < 0:
+        raise ValueError("A valid --keyframe is required for a simulation reset")
+    mujoco.mj_resetDataKeyframe(model, data, key_id)
+    if use_ctrl:
+        for side in ("right", "left"):
+            mapper.set_ctrl(data.ctrl, _get_arm_qpos(model, data, side), side)
+    mujoco.mj_forward(model, data)
+
+
 # ── dora event loop (background thread) ───────────────────────────────────────
 
 
@@ -540,6 +561,7 @@ def _run_dora(
     pose_right: np.ndarray | None = None
     pose_left: np.ndarray | None = None
     button_x_prev = False
+    reset_id = 0
 
     try:
         for event in node:
@@ -549,6 +571,33 @@ def _run_dora(
                 continue
 
             eid = event["id"]
+
+            if eid == "reset":
+                if event["value"][0].as_py() == "reset":
+                    requested_id = event["metadata"]["reset_id"]
+                    if not isinstance(requested_id, int) or requested_id <= 0:
+                        raise ValueError("reset_id must be a positive integer")
+                    if requested_id > reset_id:
+                        with _lock(viewer, data_lock):
+                            _reset_simulation(model, data, mapper, reset_key_id, use_ctrl)
+                            if randomize_range is not None:
+                                _reset_scene_objects(
+                                    model, data, reset_key_id, object_addrs,
+                                    randomize_range, rng,
+                                )
+                        reset_id = requested_id
+                        pose_right = None
+                        pose_left = None
+                        button_x_prev = False
+                        print(f"[reset] Scene and arms restored: {reset_id}", flush=True)
+                        node.send_output("reset_ready", pa.array([reset_id]))
+                continue
+
+            if (
+                eid in (*_ARM_INPUT_SIDES, "pose_right", "pose_left")
+                and event.get("metadata", {}).get("reset_id", 0) != reset_id
+            ):
+                continue
 
             if eid in _ARM_INPUT_SIDES:
                 value = event["value"]
@@ -647,6 +696,107 @@ def _run_dora(
 
 
 # ── physics + render loop ──────────────────────────────────────────────────────
+
+
+def _publish_control_snapshot(node, model, data, control_step, cam_scheduler, lock_fn):
+    with lock_fn():
+        states = {
+            side: _get_arm_state(model, data, side)
+            for side in ("right", "left")
+        }
+        metadata = {
+            "control_step": control_step,
+            "simulation_time": float(data.time),
+            "observation_timestamp": time.time_ns(),
+        }
+    for side, state in states.items():
+        node.send_output(
+            f"state_{side}", pa.array([state], type=_STATE_TYPE), metadata=metadata
+        )
+    if cam_scheduler is not None:
+        cam_scheduler.publish(lock_fn, metadata)
+    node.send_output("control_tick", pa.array([control_step]), metadata=metadata)
+
+
+def _run_synchronous(
+    node: dora.Node,
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    mapper: JointResolver,
+    stop_event: threading.Event,
+    control_hz: float,
+    lock_fn,
+    viewer=None,
+    cam_scheduler: CameraScheduler | None = None,
+) -> None:
+    timestep = float(model.opt.timestep)
+    if control_hz * timestep > 1:
+        raise ValueError("--sync-control cannot exceed the physics timestep frequency")
+    control_step = 0
+    physics_steps = 0
+    initial_time = float(data.time)
+    targets = {}
+    started = time.monotonic()
+    last_snapshot = started
+    _publish_control_snapshot(
+        node, model, data, control_step, cam_scheduler, lock_fn
+    )
+    for event in node:
+        if stop_event.is_set() or event["type"] == "STOP":
+            break
+        if event["type"] == "ERROR":
+            raise RuntimeError(event["error"])
+        if viewer is not None:
+            if not viewer.is_running():
+                break
+            viewer.sync()
+        if event["type"] != "INPUT":
+            continue
+        if time.monotonic() - last_snapshot > 60:
+            raise TimeoutError(f"No complete action for control step {control_step}")
+        name = event["id"]
+        if name == "ui_tick":
+            continue  # GUI responsiveness only; never advances physics.
+        if name not in _ARM_INPUT_SIDES:
+            raise ValueError(f"Unsupported input in synchronous mode: {name}")
+        received_step = event["metadata"].get("control_step")
+        if received_step != control_step:
+            raise ValueError(
+                f"Expected control_step={control_step}, received {received_step}"
+            )
+        side = _ARM_INPUT_SIDES[name]
+        if side in targets:
+            raise ValueError(f"Duplicate {side} action for control step {control_step}")
+        values = extract_values(event["value"], "qpos")
+        if values.shape != (8,) or not np.isfinite(values).all():
+            raise ValueError(f"Invalid {side} synchronous joint target")
+        targets[side] = values
+        if len(targets) != 2:
+            continue
+        # Alternate integer step counts instead of rounding every interval up.
+        next_physics_steps = round((control_step + 1) / (control_hz * timestep))
+        with lock_fn():
+            expected_time = initial_time + physics_steps * timestep
+            if not math.isclose(data.time, expected_time, rel_tol=0, abs_tol=1e-8):
+                raise RuntimeError("Simulation time changed externally; restart the policy flow")
+            for side, values in targets.items():
+                mapper.set_ctrl(data.ctrl, values, side)
+            for _ in range(next_physics_steps - physics_steps):
+                mujoco.mj_step(model, data)
+        physics_steps = next_physics_steps
+        control_step += 1
+        targets.clear()
+        _publish_control_snapshot(
+            node, model, data, control_step, cam_scheduler, lock_fn
+        )
+        last_snapshot = time.monotonic()
+        if control_step % 30 == 0:
+            print(
+                f"[sync] actions={control_step}, "
+                f"simulated={data.time - initial_time:.3f}s, "
+                f"wall={last_snapshot - started:.2f}s",
+                flush=True,
+            )
 
 
 def _run_loop(
@@ -900,6 +1050,20 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--sync-control",
+        nargs="?",
+        const=30.0,
+        default=None,
+        type=_positive_float,
+        metavar="HZ",
+        help=(
+            "Opt-in lockstep control (default HZ: 30). Requires --ctrl. "
+            "Wait for matching control_step targets from both arms, advance "
+            "physics by 1/HZ simulated seconds, then publish states/cameras "
+            "and control_tick. ui_tick only keeps the viewer responsive."
+        ),
+    )
+    p.add_argument(
         "--viewer",
         nargs="?",
         const=_DEFAULT_VIEWER_FPS,
@@ -969,6 +1133,8 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if args.sync_control is not None and not args.ctrl:
+        raise ValueError("--sync-control requires --ctrl")
     target_fps = args.viewer if args.viewer is not None else _DEFAULT_VIEWER_FPS
 
     stop_event = threading.Event()
@@ -1002,6 +1168,31 @@ def main() -> None:
         cam_scheduler = CameraScheduler(renderer, node, data)
 
     data_lock = threading.Lock()
+    dora_thread = None
+
+    if args.sync_control is not None:
+        try:
+            if args.viewer is not None:
+                with mujoco.viewer.launch_passive(model, data) as viewer:
+                    viewer.cam.azimuth = 0
+                    viewer.cam.elevation = -20
+                    viewer.cam.distance = 3.5
+                    viewer.cam.lookat[:] = [1.3, 0, 0.6]
+                    _run_synchronous(
+                        node, model, data, mapper, stop_event, args.sync_control,
+                        viewer.lock, viewer=viewer, cam_scheduler=cam_scheduler,
+                    )
+            else:
+                _run_synchronous(
+                    node, model, data, mapper, stop_event, args.sync_control,
+                    lambda: data_lock, cam_scheduler=cam_scheduler,
+                )
+        finally:
+            if cam_scheduler is not None:
+                cam_scheduler.close()
+            stop_event.set()
+        print("[main] Synchronous shutdown complete.")
+        return
 
     if args.viewer is not None:
         with mujoco.viewer.launch_passive(model, data) as viewer:
